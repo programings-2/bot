@@ -17,19 +17,24 @@ from app.core.storage import (
     upsert_event,
 )
 from app.services import auth_service
+from app.services import shopping_cart as cart
 from app.services.booking_orchestrator import book_all
 from app.services.distributor import describe_plan, distribute
 from app.services.event_discovery import enrich_all, fetch_event_slugs
+from app.services.football_filter import (
+    cluster_price_tiers, classify_sector,
+)
 from app.services.webook_api import (
-    get_event_detail, get_event_tickets, fetch_squares_summary,
+    get_event_detail, get_event_tickets, get_football_event_detail,
 )
 
 log = logging.getLogger("handlers")
 
 WELCOME = (
-    "👋 <b>أهلاً بك في بوت حجز التذاكر</b>\n\n"
-    "يعرض لك أحدث فعاليات webook.com ويحجز على حساباتك بالتوازي، ثم "
-    "يرجع لك روابط الدفع جاهزة.\n\n"
+    "⚽️ <b>أهلاً بك في بوت حجز تذاكر كرة القدم</b>\n\n"
+    "يعرض لك مباريات كرة القدم المتاحة على webook.com، ويساعدك في اختيار "
+    "الفريق والقطاع والفئة السعرية، ثم يحجز على حساباتك بالتوازي ويرجع لك "
+    "روابط الدفع مع أرقام المقاعد المحجوزة.\n\n"
     "اختر من القائمة:"
 )
 
@@ -38,11 +43,13 @@ HELP = (
     "الخطوات:\n"
     "1️⃣ من <b>إدارة الحسابات</b> أضف حساباً أو أكثر\n"
     "2️⃣ اضغط <b>تسجيل الدخول</b> لكل حساب (مرة واحدة فقط)\n"
-    "3️⃣ من <b>الفعاليات الجارية</b> اختر فعالية\n"
-    "4️⃣ اختر نوع التذكرة\n"
-    "5️⃣ أرسل عدد التذاكر كرسالة نصية\n"
-    "6️⃣ اضغط تأكيد — سيأتيك رابط الدفع لكل حساب\n\n"
-    "💡 <i>التوكن صالح ~٧ أيام ويُجدَّد تلقائياً.</i>"
+    "3️⃣ من <b>المباريات المتاحة</b> اختر مباراة\n"
+    "4️⃣ اختر <b>الفريق</b> (مضيف / زائر / VIP)\n"
+    "5️⃣ اختر <b>القطاع</b> ثم <b>الفئة السعرية</b>\n"
+    "6️⃣ أدخل عدد التذاكر\n"
+    "7️⃣ راجع السلة ثم <b>تأكيد</b> — سيأتيك رابط الدفع وأرقام المقاعد\n\n"
+    "💡 <i>التوكن صالح ~٧ أيام ويُجدَّد تلقائياً.</i>\n"
+    "⚽ <i>البوت يعرض فقط مباريات كرة القدم بناءً على طلبك.</i>"
 )
 
 
@@ -182,14 +189,66 @@ async def _route(chat_id: str, msg_id: int, data: str,
                           edit_msg_id=msg_id, event_token=t)
         return
     if data.startswith("tck:"):
+        # Legacy path — keep working for old tokens still in flight.
         t = data.split(":", 1)[1]
         entry = tok.get(t)
         if not entry:
             await notifier.edit(chat_id, msg_id,
                                 "انتهت صلاحية هذا الرابط.",
                                 reply_markup=kb.back_to_menu()); return
-        await _ask_quantity(chat_id, entry["slug"], entry["ticket_id"],
+        await _select_sector(chat_id, msg_id,
+                             entry["slug"], entry["ticket_id"], notifier)
+        return
+    if data.startswith("side:"):
+        # Step 1 → 2: user picked a team-side bucket
+        t = data.split(":", 1)[1]
+        entry = tok.get(t)
+        if not entry:
+            await notifier.edit(chat_id, msg_id,
+                                "انتهت صلاحية هذا الرابط.",
+                                reply_markup=kb.back_to_menu()); return
+        await _show_sectors(chat_id, msg_id, entry["slug"],
+                            entry["side"], notifier)
+        return
+    if data.startswith("clu:"):
+        # Step 2 → 2b: user picked a multi-tier sector cluster
+        t = data.split(":", 1)[1]
+        entry = tok.get(t)
+        if not entry:
+            await notifier.edit(chat_id, msg_id,
+                                "انتهت صلاحية هذا الرابط.",
+                                reply_markup=kb.back_to_menu()); return
+        await _show_price_tiers(chat_id, msg_id, entry, notifier)
+        return
+    if data.startswith("sec:"):
+        # Step 2/2b → 3: user picked a concrete ticket (sector + tier)
+        t = data.split(":", 1)[1]
+        entry = tok.get(t)
+        if not entry:
+            await notifier.edit(chat_id, msg_id,
+                                "انتهت صلاحية هذا الرابط.",
+                                reply_markup=kb.back_to_menu()); return
+        await _select_sector(chat_id, msg_id, entry["slug"],
+                             entry["ticket_id"], notifier,
+                             side=entry.get("side"))
+        return
+    if data.startswith("qty:"):
+        # User wants to change quantity from the review screen.
+        t = data.split(":", 1)[1]
+        c = cart.get(chat_id)
+        if not c or not c.ticket_id:
+            await notifier.edit(chat_id, msg_id,
+                                "🛒 السلة فارغة. ابدأ من جديد.",
+                                reply_markup=kb.back_to_menu()); return
+        await _ask_quantity(chat_id, c.event_slug, c.ticket_id,
                             msg_id, notifier)
+        return
+    if data == "cart:cancel":
+        cart.clear(chat_id)
+        fsm.clear_state(chat_id)
+        await notifier.edit(chat_id, msg_id,
+                            "🛒 تم إلغاء السلة.",
+                            reply_markup=kb.main_menu())
         return
     if data.startswith("go:"):
         t = data.split(":", 1)[1]
@@ -323,86 +382,191 @@ async def _show_events(chat_id: str, msg_id: int, arg: str,
 async def _show_event(chat_id: str, slug: str, notifier: Notifier,
                       edit_msg_id: int | None = None,
                       event_token: str | None = None) -> None:
-    # Fetch BOTH detail (authoritative title) + tickets in parallel
-    detail_task = asyncio.create_task(get_event_detail(slug))
-    tix_task = asyncio.create_task(get_event_tickets(slug))
-    detail = await detail_task
-    data = await tix_task
+    """Football-only event landing screen.
 
-    if not detail and not data:
-        t = "⚠️ تعذّر جلب بيانات الفعالية."
-        if edit_msg_id:
-            await notifier.edit(chat_id, edit_msg_id, t,
-                                reply_markup=kb.back_to_menu())
-        else:
-            await notifier.send(chat_id, t, reply_markup=kb.back_to_menu())
-        return
-
-    title = (detail or {}).get("title") or (data or {}).get("event", {}).get("title") or slug
-    sub = (detail or {}).get("sub_title") or ""
-    desc_raw = (detail or {}).get("description") or ""
-    import re
-    desc = re.sub(r"<[^>]+>", " ", desc_raw)
-    desc = re.sub(r"\s+", " ", desc).strip()[:300]
-
-    tickets = (data or {}).get("tickets") or []
-    active = [t for t in tickets if t.get("status") == "active"]
-    is_seated = (bool((data or {}).get("is_seated"))
-                 or bool((detail or {}).get("is_seated")))
-
-    txt = f"🎭 <b>{title}</b>\n"
-    if sub:
-        txt += f"{sub}\n"
-    if desc:
-        txt += f"\n{desc}\n"
-
-    if active and is_seated:
-        # SEATED event: render colored-squares "stadium map" interface
-        summary = await fetch_squares_summary(slug)
-        squares = [s for s in (summary.get("squares") or [])
-                   if s.get("sale_status") in ("ongoing", None)]
-        if summary.get("has_seat_name"):
-            txt += ("\n🏟️ <i>الفعالية تحتوي خريطة مقاعد تفاصيلية.</i>\n"
-                    "سيتم اختيار المقاعد المتجاورة تلقائياً بعد تحديد المربع.\n")
-        if squares:
-            avail_sum = sum(
-                (sq["available"] if isinstance(sq.get("available"), int)
-                 and sq["available"] >= 0 else 0)
-                for sq in squares
-            )
-            txt += (f"\n🏟️ <b>مربعات الملعب/المنتدى:</b> "
-                    f"{len(squares)} مربع\n")
-            if avail_sum > 0:
-                txt += (f"🪑 إجمالي المقاعد المتاحة (تقريبي): "
-                        f"<b>{avail_sum}</b>\n")
-            txt += ("\n💡 <i>كل مربع = قسم من الملعب. "
-                    "انقر على مربع للاختيار — البوت سيحجز مقاعد متجاورة "
-                    "داخل نفس المربع لكل حساب.</i>\n")
-            rkb = kb.seat_map_keyboard(slug, squares)
-        else:
-            txt += "\n⚠️ <i>لا توجد مربعات متاحة للحجز حالياً.</i>"
-            rkb = kb.back_to_menu()
-    elif active:
-        txt += f"\n🎟️ أنواع التذاكر المتاحة: <b>{len(active)}</b>\n\n"
-        txt += "اختر نوع التذكرة:"
-        rkb = kb.ticket_types_keyboard(slug, tickets)
-    else:
-        # Maybe it's a subscription event or sale not yet open
-        txt += "\n⚠️ <i>لا توجد تذاكر متاحة حالياً عبر API.</i>\n"
-        txt += ("قد تكون الفعالية تتطلب اشتراكاً، أو لم يُفتح بيعها بعد، "
-                "أو تُباع بطريقة مختلفة (مثل seats.io). "
-                "افتحها في المتصفح للتأكد:")
+    Strategy:
+      1. Use :func:`get_football_event_detail` (parallel detail+tickets).
+      2. Reject non-football slugs explicitly.
+      3. Render the team-selection keyboard.
+      4. Seed the shopping cart with event + team metadata.
+    """
+    payload = await get_football_event_detail(slug)
+    if not payload:
+        # Either the slug is not a football match or the API call failed.
+        # Reject explicitly so the user understands the bot's scope.
+        t = (
+            "⚠️ <b>هذه الفعالية ليست مباراة كرة قدم</b>\n\n"
+            "البوت الآن يدعم فقط مباريات كرة القدم. استخدم زر تحديث الفعاليات "
+            "لجلب أحدث المباريات."
+        )
         rkb = {"inline_keyboard": [
-            [{"text": "🌐 فتح الفعالية في المتصفح",
-              "url": f"https://webook.com/ar/events/{slug}"}],
-            [{"text": "⬅️ رجوع للفعاليات", "callback_data": "events:0"}],
+            [{"text": "⚽ المباريات المتاحة",
+              "callback_data": "events:0"}],
             [{"text": "🏠 القائمة", "callback_data": "menu"}],
         ]}
+        if edit_msg_id:
+            await notifier.edit(chat_id, edit_msg_id, t, reply_markup=rkb)
+        else:
+            await notifier.send(chat_id, t, reply_markup=rkb)
+        return
+
+    # ── Seed shopping cart with event + teams ────────────────────────────
+    # We RESET the cart on every event-open so picking a different match
+    # doesn't leak stale fields from a prior journey.
+    cart.clear(chat_id)
+    cart.update(
+        chat_id,
+        event_slug=slug,
+        event_title=payload["title"],
+        event_id=payload["event_id"],
+        is_seated=payload["is_seated"],
+        team_a_id=payload["team_a"]["id"],
+        team_a_name=payload["team_a"]["name"],
+        team_a_logo=payload["team_a"]["logo"],
+        team_b_id=payload["team_b"]["id"],
+        team_b_name=payload["team_b"]["name"],
+        team_b_logo=payload["team_b"]["logo"],
+    )
+
+    # ── Compose Telegram message ─────────────────────────────────────────
+    ta = payload["team_a"]["name"]
+    tb = payload["team_b"]["name"]
+    venue = payload.get("venue_name") or "—"
+    sectors = payload["sectors"]
+    if not sectors:
+        # Football match recognised but no active tickets yet (sale not open / sold out)
+        txt = (
+            f"⚽ <b>{ta} ⚔️ {tb}</b>\n"
+            f"🏟️ الملعب: {venue}\n\n"
+            f"⚠️ لا توجد تذاكر متاحة للحجز حالياً.\n"
+            f"<i>ربما لم يُفتح البيع بعد، أو أن التذاكر نفدت.</i>"
+        )
+        rkb = {"inline_keyboard": [
+            [{"text": "🌐 فتح في المتصفح",
+              "url": f"https://webook.com/ar/events/{slug}"}],
+            [{"text": "⬅️ المباريات", "callback_data": "events:0"}],
+            [{"text": "🏠 القائمة", "callback_data": "menu"}],
+        ]}
+    else:
+        buckets = payload["by_side"]
+        n_home = len(buckets.get("home") or [])
+        n_away = len(buckets.get("away") or [])
+        n_vip = len(buckets.get("vip") or [])
+        n_neu = len(buckets.get("neutral") or [])
+        txt = (
+            f"⚽ <b>{ta} ⚔️ {tb}</b>\n"
+            f"🏟️ الملعب: {venue}\n"
+            f"🎟️ إجمالي القطاعات: <b>{len(sectors)}</b>\n\n"
+            f"👥 <b>اختر جمهورك:</b>\n"
+            f"   • جمهور {ta}: <b>{n_home}</b> قطاع\n"
+            f"   • جمهور {tb}: <b>{n_away}</b> قطاع\n"
+            f"   • المنصات/VIP: <b>{n_vip}</b> قطاع\n"
+            f"   • أخرى: <b>{n_neu}</b> قطاع\n\n"
+            f"💡 <i>ستختار بعد ذلك القطاع ثم الفئة السعرية ثم عدد التذاكر.</i>"
+        )
+        rkb = kb.team_selection_keyboard(slug, ta, tb, buckets)
 
     if edit_msg_id:
         await notifier.edit(chat_id, edit_msg_id, txt, reply_markup=rkb)
     else:
         await notifier.send(chat_id, txt, reply_markup=rkb)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Sector / price-tier / quantity / review screens
+# ════════════════════════════════════════════════════════════════════════
+async def _show_sectors(chat_id: str, msg_id: int, slug: str, side: str,
+                        notifier: Notifier) -> None:
+    """After the user picks a side bucket, show the clusters of sectors."""
+    payload = await get_football_event_detail(slug)
+    if not payload:
+        await notifier.edit(chat_id, msg_id,
+                            "⚠️ لم أستطع تحميل بيانات المباراة.",
+                            reply_markup=kb.back_to_menu())
+        return
+    bucket = (payload["by_side"] or {}).get(side, [])
+    clusters = cluster_price_tiers(bucket)
+
+    side_lbl = {
+        "home": f"جمهور {payload['team_a']['name']}",
+        "away": f"جمهور {payload['team_b']['name']}",
+        "vip":  "المنصات / VIP",
+        "neutral": "قطاعات أخرى",
+    }.get(side, side)
+
+    # Persist the chosen side on the cart so review can show it.
+    cart.update(chat_id, chosen_side=side, chosen_team_label=side_lbl)
+
+    txt = (
+        f"⚽ <b>{payload['team_a']['name']} ⚔️ {payload['team_b']['name']}</b>\n"
+        f"👥 <b>{side_lbl}</b>\n\n"
+        f"🎟️ <b>القطاعات المتاحة:</b> {len(bucket)}\n\n"
+        f"اختر القطاع:"
+    )
+    rkb = kb.sector_selection_keyboard(slug, side, clusters)
+    await notifier.edit(chat_id, msg_id, txt, reply_markup=rkb)
+
+
+async def _show_price_tiers(chat_id: str, msg_id: int, entry: dict,
+                            notifier: Notifier) -> None:
+    """Multi-tier cluster expansion (e.g. الواجهة vs الدرجة الأولى)."""
+    slug = entry["slug"]
+    side = entry.get("side", "")
+    ticket_ids = (entry.get("ticket_ids") or "").split(",")
+    cluster_title = entry.get("cluster_title") or "القطاع"
+    payload = await get_football_event_detail(slug)
+    if not payload:
+        await notifier.edit(chat_id, msg_id,
+                            "⚠️ تعذرت إعادة تحميل الفئات.",
+                            reply_markup=kb.back_to_menu())
+        return
+    txt = (
+        f"⚽ <b>{payload['team_a']['name']} ⚔️ {payload['team_b']['name']}</b>\n"
+        f"🎟️ <b>{cluster_title}</b>\n\n"
+        f"اختر الفئة السعرية:"
+    )
+    rkb = kb.price_tier_keyboard(slug, side, ticket_ids, payload["sectors"])
+    await notifier.edit(chat_id, msg_id, txt, reply_markup=rkb)
+
+
+async def _select_sector(chat_id: str, msg_id: int, slug: str,
+                         ticket_id: str, notifier: Notifier,
+                         side: str | None = None) -> None:
+    """Resolve the chosen ticket, save it to the cart, ask for quantity."""
+    payload = await get_football_event_detail(slug)
+    if not payload:
+        await notifier.edit(chat_id, msg_id,
+                            "⚠️ فعالية غير مدعومة.",
+                            reply_markup=kb.back_to_menu())
+        return
+    ticket = next((t for t in payload["sectors"] if t["id"] == ticket_id), None)
+    if not ticket:
+        await notifier.edit(chat_id, msg_id,
+                            "⚠️ لم أعثر على القطاع المختار.",
+                            reply_markup=kb.back_to_menu())
+        return
+    chosen_side = side or classify_sector(ticket)
+    side_lbl = {
+        "home": f"جمهور {payload['team_a']['name']}",
+        "away": f"جمهور {payload['team_b']['name']}",
+        "vip":  "المنصات / VIP",
+        "neutral": "قطاع محايد",
+    }.get(chosen_side, chosen_side)
+    cart.update(
+        chat_id,
+        chosen_side=chosen_side,
+        chosen_team_label=side_lbl,
+        ticket_id=ticket["id"],
+        ticket_title=ticket["title"] or "قطاع",
+        ticket_color=ticket.get("ticket_color") or "",
+        seats_io_category=str(ticket.get("seats_io_category") or ""),
+        group_name=ticket.get("group_name") or "",
+        price=float(ticket.get("display_price") or ticket.get("price") or 0),
+        currency=ticket.get("currency") or "SAR",
+        max_per_order=int(ticket.get("max_per_order") or 5),
+        min_per_order=int(ticket.get("min_per_order") or 1),
+    )
+    await _ask_quantity(chat_id, slug, ticket["id"], msg_id, notifier)
 
 
 async def _ask_quantity(chat_id: str, slug: str, ticket_id: str,
