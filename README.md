@@ -101,12 +101,4 @@ main.py                     ← FastAPI + lifespan + webhook
 | `LOGIN_CAPTCHA_TIMEOUT` | `180` | ث انتظار حل الـ captcha من المستخدم |
 | `HEADLESS` | `true` | Chromium headless |
 | `LOG_LEVEL` | `INFO` | `DEBUG` لتفاصيل أكثر |
-
----
-
-## ⚠️ قيود وتحذيرات
-
-- **webook يستخدم reCAPTCHA** — لا يمكن تجاوزه برمجياً. نحن نحوّله إليك لحلّه يدوياً مرة واحدة لكل login.
-- **طريقة الدفع PayTabs فقط** — webook لا يدعم PayPal. البوت يُرجع رابط PayTabs مباشرة وأنت تختار طريقة الدفع من صفحة PayTabs.
-- **الخطة المجانية من Render = 512MB RAM** — Playwright يُشغَّل لحظياً فقط عند login (حتى 60 ثانية)، ثم يُغلق. بقية العمليات HTTP خفيفة جداً.
-- هذا المشروع تعليمي. استخدام بوتات الحجز قد يخالف شروط الخدمة.
+دمة.
