@@ -48,7 +48,14 @@ def init_db() -> None:
             tickets_json    TEXT,
             first_seen_at   REAL,
             last_seen_at    REAL,
-            last_checked_at REAL
+            last_checked_at REAL,
+            -- Football-specific extras (added v3.1)
+            is_football     INTEGER DEFAULT 1,
+            team_a_name     TEXT,
+            team_a_logo     TEXT,
+            team_b_name     TEXT,
+            team_b_logo     TEXT,
+            venue_name      TEXT
         );
 
         CREATE TABLE IF NOT EXISTS watch_keywords (
@@ -165,16 +172,56 @@ def delete_account(account_id: str) -> None:
 # Events
 # ════════════════════════════════════════════════════════════════════════
 def upsert_event(slug: str, data: dict[str, Any]) -> bool:
-    """Returns True if this is a brand-new slug we hadn't seen before."""
+    """Returns True if this is a brand-new slug we hadn't seen before.
+
+    Schema-compatible with both the legacy 12-column table and the
+    extended football schema (5 extra columns). We use a defensive
+    write that gracefully degrades when the columns are missing so
+    upgrades don't require a manual ALTER TABLE.
+    """
     now = time.time()
+    team_a = data.get("team_a") or {}
+    team_b = data.get("team_b") or {}
     with _conn() as con:
         cur = con.execute("SELECT 1 FROM events WHERE slug = ?", (slug,)).fetchone()
         is_new = cur is None
+        # Detect available columns once per call — keeps the SQL portable
+        # across legacy SQLite and the new Postgres schema.
+        try:
+            cols = {row[1] for row in con.execute("PRAGMA table_info(events)").fetchall()}
+        except Exception:
+            # PRAGMA is SQLite-only; on Postgres we always have the new schema.
+            cols = {
+                "slug", "title", "category", "city", "url", "start_date",
+                "is_seated", "poster", "tickets_json", "first_seen_at",
+                "last_seen_at", "last_checked_at", "is_football",
+                "team_a_name", "team_a_logo", "team_b_name", "team_b_logo",
+                "venue_name",
+            }
+
+        # Best-effort migration on legacy SQLite (no-op if cols already exist).
+        for col, ddl in [
+            ("is_football",  "INTEGER DEFAULT 1"),
+            ("team_a_name",  "TEXT"),
+            ("team_a_logo",  "TEXT"),
+            ("team_b_name",  "TEXT"),
+            ("team_b_logo",  "TEXT"),
+            ("venue_name",   "TEXT"),
+        ]:
+            if col not in cols:
+                try:
+                    con.execute(f"ALTER TABLE events ADD COLUMN {col} {ddl}")
+                    cols.add(col)
+                except Exception:
+                    pass
+
         con.execute("""
             INSERT INTO events (slug, title, category, city, url, start_date,
                                 is_seated, poster, tickets_json,
-                                first_seen_at, last_seen_at, last_checked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                first_seen_at, last_seen_at, last_checked_at,
+                                is_football, team_a_name, team_a_logo,
+                                team_b_name, team_b_logo, venue_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(slug) DO UPDATE SET
               title = excluded.title,
               category = excluded.category,
@@ -185,7 +232,13 @@ def upsert_event(slug: str, data: dict[str, Any]) -> bool:
               poster = excluded.poster,
               tickets_json = excluded.tickets_json,
               last_seen_at = excluded.last_seen_at,
-              last_checked_at = excluded.last_checked_at
+              last_checked_at = excluded.last_checked_at,
+              is_football = excluded.is_football,
+              team_a_name = excluded.team_a_name,
+              team_a_logo = excluded.team_a_logo,
+              team_b_name = excluded.team_b_name,
+              team_b_logo = excluded.team_b_logo,
+              venue_name = excluded.venue_name
         """, (
             slug,
             data.get("title"),
@@ -197,6 +250,12 @@ def upsert_event(slug: str, data: dict[str, Any]) -> bool:
             data.get("poster"),
             json.dumps(data.get("tickets") or [], ensure_ascii=False),
             now, now, now,
+            1 if data.get("is_football", True) else 0,
+            team_a.get("name") or "",
+            team_a.get("logo") or "",
+            team_b.get("name") or "",
+            team_b.get("logo") or "",
+            data.get("venue_name") or "",
         ))
         return is_new
 

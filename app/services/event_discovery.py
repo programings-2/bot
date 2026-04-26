@@ -157,18 +157,32 @@ async def enrich_slug(slug: str, url: str = "") -> dict[str, Any] | None:
     if m:
         category = m.group(1)
 
+    # ── Football-only filter ──────────────────────────────────────────
+    # The bot's UX is now strictly tailored to football matches. We
+    # drop any event whose ``sport.slug != 'football'`` (with the
+    # home_team/away_team fallback inside is_football_event).
+    from app.services.football_filter import is_football_event, extract_teams
+    if not is_football_event(ev):
+        return None
+
+    teams = extract_teams(ev)
     title = ev.get("title") or ev.get("name") or slug
     return {
         "slug": slug,
         "title": title,
         "url": url,
         "city": city,
-        "category": category,
+        "category": category or "football",
         "is_seated": bool(ev.get("is_seated")),
         "poster": (ev.get("poster") or ev.get("mobile_poster")
                    or ev.get("promo_poster") or ""),
         "start_date": ev.get("start_date_time"),
         "tickets": tickets,
+        # Football-specific extras
+        "is_football": True,
+        "team_a": teams["team_a"],
+        "team_b": teams["team_b"],
+        "venue_name": ev.get("venue_name") or "",
     }
 
 

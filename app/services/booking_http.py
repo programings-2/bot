@@ -370,6 +370,26 @@ async def book_ticket_http(*, bearer: str, slug: str, ticket_id: str,
             return result
         result["logs"].append(f"🛒 cart ok ({cart_data.get('item_quantity', quantity)} tickets)")
 
+        # 4b. Scrape seat labels from the LIVE cart — webook stores the
+        #     reserved seat IDs/labels under cart-items right after
+        #     add-to-cart succeeds (and BEFORE checkout finalises). For
+        #     seated events these are the actual numbered seats; for
+        #     non-seated events the field is absent (we just skip).
+        try:
+            seat_labels = await fetch_cart_seat_labels(
+                session, parent_event_id=event_id, bearer=bearer,
+            )
+            if seat_labels:
+                prev = (result.get("seat_info") or {}).get("seats") or []
+                merged = list(dict.fromkeys([*prev, *seat_labels]))
+                result["seat_info"] = {"seats": merged}
+                result["logs"].append(
+                    f"🪑 seats from cart: {', '.join(merged[:6])}"
+                    + (f" (+{len(merged)-6})" if len(merged) > 6 else "")
+                )
+        except Exception as _e:  # pragma: no cover
+            log.debug(f"cart-seat scrape failed (non-fatal): {_e}")
+
         # 5. Create checkout = get PayTabs URL
         ok, co_data = await create_checkout(
             session, slug=slug, event_id=event_id,

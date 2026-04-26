@@ -407,51 +407,30 @@ async def _show_event(chat_id: str, slug: str, notifier: Notifier,
 
 async def _ask_quantity(chat_id: str, slug: str, ticket_id: str,
                         msg_id: int, notifier: Notifier) -> None:
-    """Step 1 of booking — show ticket/square info and ask for TOTAL qty.
-
-    NEW LOGIC: The user sends the TOTAL number of tickets to book (not
-    per-account). The bot then greedy-distributes across as few accounts
-    as needed, respecting each account's max_per_order.
-    """
-    data = await get_event_tickets(slug)
-    ticket = next(
-        (t for t in (data.get("tickets") or []) if t["id"] == ticket_id),
-        None,
-    )
+    """Step 3 of booking — show selected sector + ask for TOTAL quantity."""
+    payload = await get_football_event_detail(slug)
+    if not payload:
+        await notifier.edit(chat_id, msg_id, "⚠️ فعالية غير مدعومة.",
+                            reply_markup=kb.back_to_menu())
+        return
+    ticket = next((t for t in payload["sectors"] if t["id"] == ticket_id), None)
     if not ticket:
         await notifier.edit(chat_id, msg_id, "⚠️ لم أجد نوع التذكرة.",
                             reply_markup=kb.back_to_menu())
         return
 
-    is_seated = bool((data or {}).get("is_seated"))
-    # For seated events, enrich with availability for THIS square
-    available = None
-    group_name = None
-    if is_seated:
-        try:
-            summary = await fetch_squares_summary(slug)
-            for sq in summary.get("squares") or []:
-                if sq["id"] == ticket_id:
-                    available = sq.get("available")
-                    group_name = sq.get("group_name")
-                    break
-        except Exception:
-            pass
-
     accounts = [a for a in list_accounts(status="ready")
                 if a.get("access_token")]
-
     price = ticket.get("display_price") or 0
     ccy = kb._ccy(ticket.get("currency") or "SAR")
     price_str = f"{kb._fmt_price(price)} {ccy}" if price else "يظهر عند الحجز"
-
     max_per_acc = ticket["max_per_order"]
     min_q = ticket.get("min_per_order", 1)
     max_total = max_per_acc * max(len(accounts), 1)
 
     if len(accounts) == 0:
         txt = (
-            f"🎫 <b>{ticket['title']}</b>\n"
+            f"🎟️ <b>{ticket['title']}</b>\n"
             f"💰 السعر: <b>{price_str}</b>\n\n"
             f"⚠️ لا يوجد لديك حسابات مُفعّلة بعد.\n"
             f"أضف حساباً من <b>إدارة الحسابات</b> أولاً."
@@ -460,41 +439,22 @@ async def _ask_quantity(chat_id: str, slug: str, ticket_id: str,
                             reply_markup=kb.back_to_menu())
         return
 
-    # Store context — user's next text reply maps back here
-    fsm.set_state(
-        chat_id, "waiting_qty",
-        slug=slug, ticket_id=ticket_id,
-    )
+    fsm.set_state(chat_id, "waiting_qty", slug=slug, ticket_id=ticket_id)
 
-    # Seated reminder — show which square the user selected + availability
-    square_info = ""
-    if is_seated:
-        if available is None or available == -1:
-            avail_txt = "غير محدّد (الحجز مفتوح)"
-        elif available == 0:
-            avail_txt = "نفد — اختر مربعاً آخر"
-        else:
-            avail_txt = f"<b>{available}</b> مقعد"
-        square_info = (
-            f"🏟️ <b>تذكير بالمربع المختار:</b>\n"
-            f"   📍 القسم: <b>{ticket['title']}</b>"
-            f"{' — ' + group_name if group_name and group_name != 'GA' else ''}\n"
-            f"   🪑 المقاعد المتاحة: {avail_txt}\n"
-            f"   💰 سعر المقعد (شامل الضريبة): <b>{price_str}</b>\n\n"
-        )
+    # Cart context (chosen team-side label) for the prompt header
+    c = cart.get(chat_id)
+    side_lbl = (c.chosen_team_label if c else "") or "—"
 
     txt = (
-        f"🎫 <b>{ticket['title']}</b>\n\n"
-        f"{square_info}"
-        f"💰 سعر التذكرة: <b>{price_str}</b>\n"
-        f"👥 حسابات جاهزة: <b>{len(accounts)}</b>\n"
-        f"📊 الحد الأقصى لكل حساب: <b>{max_per_acc}</b> تذكرة\n"
-        f"🧮 <b>أقصى إجمالي يمكنك حجزه: {max_total} تذكرة</b>\n"
-        f"🔢 الحد الأدنى: <b>{min_q}</b> تذكرة\n\n"
-        f"✏️ <b>أدخل العدد الإجمالي للتذاكر</b> (برقم):\n\n"
-        f"💡 <i>مثال: لو أدخلت 8، ولديك {len(accounts)} حسابات بحد "
-        f"{max_per_acc}/حساب، سيوزعها البوت تلقائياً على أقل عدد "
-        f"من الحسابات.</i>"
+        f"⚽ <b>{payload['team_a']['name']} ⚔️ {payload['team_b']['name']}</b>\n"
+        f"👥 الجمهور: <b>{side_lbl}</b>\n"
+        f"🎟️ القطاع: <b>{ticket['title']}</b>\n"
+        f"💰 السعر: <b>{price_str}</b>\n"
+        f"👤 حسابات جاهزة: <b>{len(accounts)}</b>\n"
+        f"📊 الحد لكل حساب: <b>{max_per_acc}</b> • أقصى إجمالي: <b>{max_total}</b>\n"
+        f"🔢 الحد الأدنى: <b>{min_q}</b>\n\n"
+        f"✏️ <b>أدخل عدد التذاكر الإجمالي</b> (رقم فقط):\n\n"
+        f"💡 <i>سأوزعها تلقائياً على أقل عدد ممكن من الحسابات.</i>"
     )
     await notifier.edit(chat_id, msg_id, txt,
                         reply_markup=kb.back_to_menu())
@@ -502,12 +462,17 @@ async def _ask_quantity(chat_id: str, slug: str, ticket_id: str,
 
 async def _show_plan(chat_id: str, slug: str, ticket_id: str, qty: int,
                      notifier: Notifier) -> None:
-    data = await get_event_tickets(slug)
-    detail = await get_event_detail(slug)
-    ticket = next(
-        (t for t in (data.get("tickets") or []) if t["id"] == ticket_id),
-        None,
-    )
+    """Step 4 — RICH cart-review screen (no booking yet!).
+
+    Shows: match • chosen team-side • sector • quantity • distribution
+    plan • total amount. User must press ✅ تأكيد to commit.
+    """
+    payload = await get_football_event_detail(slug)
+    if not payload:
+        await notifier.send(chat_id, "⚠️ فعالية غير مدعومة.",
+                            reply_markup=kb.back_to_menu())
+        return
+    ticket = next((t for t in payload["sectors"] if t["id"] == ticket_id), None)
     if not ticket:
         await notifier.send(chat_id, "⚠️ نوع التذكرة غير موجود.",
                             reply_markup=kb.back_to_menu())
@@ -524,47 +489,51 @@ async def _show_plan(chat_id: str, slug: str, ticket_id: str, qty: int,
                f"السبب: <code>{e}</code>\n\n"
                f"الحلول:\n"
                f"• قلّل العدد\n"
-               f"• أضف حسابات جديدة\n")
+               f"• أضف حسابات جديدة")
         await notifier.send(chat_id, txt, reply_markup=kb.back_to_menu())
         return
 
-    price = ticket.get("display_price") or 0
+    price = float(ticket.get("display_price") or ticket.get("price") or 0)
     actual_total = meta["actual_total"]
     total_amount = price * actual_total
     ccy = kb._ccy(ticket.get("currency") or "SAR")
-    title = (detail or {}).get("title") or slug
 
-    # Carry the plan into the booking step (actual_total after clamp)
+    # Persist quantity to the cart (review step is idempotent)
+    cart.update(chat_id, quantity=actual_total)
+    c = cart.get(chat_id)
+
+    # Token carries the FINAL booking context (slug + ticket + qty after clamp)
     context_tok = tok.put({
         "slug": slug, "ticket_id": ticket_id,
         "qty": actual_total,
     })
 
-    # Seated reminder
-    is_seated = bool((data or {}).get("is_seated"))
-    seated_hint = ""
-    if is_seated:
-        seated_hint = (
-            f"🏟️ <i>المربع المختار:</i> <b>{ticket['title']}</b>\n"
-            f"🪑 <i>سيتم اختيار مقاعد متجاورة داخل نفس المربع لكل "
-            f"حساب.</i>\n\n"
-        )
+    side_lbl = (c.chosen_team_label if c else
+                {"home": f"جمهور {payload['team_a']['name']}",
+                 "away": f"جمهور {payload['team_b']['name']}",
+                 "vip":  "المنصات / VIP",
+                 "neutral": "قطاع محايد"}.get(
+                    classify_sector(ticket), "جمهور"))
 
     txt = (
-        f"📊 <b>خطة التوزيع</b>\n\n"
-        f"🎭 {title}\n"
-        f"🎫 {ticket['title']}\n"
-        f"{seated_hint}"
-        f"🧮 طلبك: <b>{qty}</b> تذكرة\n"
-        f"✅ سنحجز فعلياً: <b>{actual_total}</b> تذكرة\n"
-        f"👥 حسابات مستخدمة: <b>{meta['accounts_used']}</b> "
-        f"من أصل <b>{meta['accounts_available']}</b>\n"
-        f"💰 المجموع التقريبي: <b>{kb._fmt_price(total_amount)} {ccy}</b>\n\n"
+        f"🛒 <b>مراجعة السلة</b>\n\n"
+        f"⚽ <b>المباراة:</b> {payload['team_a']['name']} ⚔️ "
+        f"{payload['team_b']['name']}\n"
+        f"🏟️ <b>الملعب:</b> {payload.get('venue_name') or '—'}\n"
+        f"👥 <b>الجمهور:</b> {side_lbl}\n"
+        f"🎟️ <b>القطاع:</b> {ticket['title']}\n"
+        f"💰 <b>سعر التذكرة:</b> {kb._fmt_price(price)} {ccy}\n"
+        f"🧮 <b>طلبك:</b> {qty} تذكرة\n"
+        f"✅ <b>سنحجز فعلياً:</b> {actual_total} تذكرة\n"
+        f"🎯 <b>حسابات مستخدمة:</b> {meta['accounts_used']} / "
+        f"{meta['accounts_available']}\n"
+        f"💳 <b>المجموع التقريبي:</b> {kb._fmt_price(total_amount)} {ccy}\n\n"
         f"{describe_plan(plan, accounts, meta)}\n\n"
-        f"هل أبدأ الحجز؟"
+        f"🪑 <i>أرقام المقاعد ستظهر مع روابط الدفع بعد التأكيد.</i>\n\n"
+        f"هل ترغب في تأكيد الحجز؟"
     )
     await notifier.send(chat_id, txt,
-                        reply_markup=kb.confirm_plan_keyboard(context_tok))
+                        reply_markup=kb.cart_review_keyboard(context_tok))
 
 
 async def _ask_payment_method(chat_id: str, msg_id: int,
@@ -656,12 +625,21 @@ async def _execute_booking(chat_id: str, msg_id: int,
     ]
     for r in succ:
         seat = r.get("seat_info") or {}
+        # Webook returns one of two shapes:
+        #   1) {"seats": ["A12", "A13"]}        — from cart-items API
+        #   2) {"section":"...","row":"...","seat_number":"..."}  — single seat
         seat_line = ""
-        if seat.get("section") or seat.get("seat_number"):
+        seats_arr = seat.get("seats") if isinstance(seat, dict) else None
+        if seats_arr and isinstance(seats_arr, list):
+            shown = ", ".join(str(s) for s in seats_arr[:8])
+            if len(seats_arr) > 8:
+                shown += f" … +{len(seats_arr)-8}"
+            seat_line = f"   🪑 المقاعد: <b>{shown}</b>\n"
+        elif seat.get("section") or seat.get("seat_number"):
             seat_line = (
                 f"   🪑 القسم: {seat.get('section', '—')} · "
                 f"صف: {seat.get('row', '—')} · "
-                f"كرسي: {seat.get('seat_number', '—')}\n"
+                f"كرسي: <b>{seat.get('seat_number', '—')}</b>\n"
             )
         lines.append(
             f"✅ <code>{r['label']}</code> — {r['quantity']} تذكرة\n"
@@ -694,6 +672,9 @@ async def _execute_booking(chat_id: str, msg_id: int,
          "url": f"https://webook.com/ar/events/{slug}/book"}
     ])
     keyboard_rows.append([{"text": "⬅️ القائمة", "callback_data": "menu"}])
+
+    # Booking concluded — wipe the cart so the next /start is fresh.
+    cart.clear(chat_id)
 
     await notifier.edit(chat_id, msg_id, "\n".join(lines),
                         reply_markup={"inline_keyboard": keyboard_rows})

@@ -90,6 +90,68 @@ async def get_event_detail(slug: str,
     return None
 
 
+async def get_football_event_detail(slug: str,
+                                    lang: Optional[str] = None
+                                    ) -> dict[str, Any] | None:
+    """
+    Football-aware variant of :func:`get_event_detail`.
+
+    Fetches both event-detail and event-ticket-details in parallel,
+    enforces ``sport.slug == 'football'`` (or the home_team/away_team
+    fallback) and returns a denormalised payload tailored to the bot:
+
+        {
+            "slug": str,
+            "title": str,
+            "is_seated": bool,
+            "poster": str,
+            "start_date": int,
+            "venue_name": str,
+            "team_a": {id, name, logo, side="home"},
+            "team_b": {id, name, logo, side="away"},
+            "event_id": str,
+            "sectors":     [<normalised ticket dict>, ...],   # all active sectors
+            "by_side":     {"home":[...], "away":[...], "vip":[...], "neutral":[...]},
+        }
+
+    Returns ``None`` when the slug is not a football event.
+    """
+    import asyncio as _aio
+    from app.services.football_filter import (
+        is_football_event, extract_teams, group_tickets_by_side,
+    )
+
+    detail_t = _aio.create_task(get_event_detail(slug, lang=lang))
+    tix_t = _aio.create_task(get_event_tickets(slug, lang=lang))
+    detail = await detail_t
+    tix = await tix_t or {}
+
+    if not detail or not is_football_event(detail):
+        return None
+
+    teams = extract_teams(detail)
+    raw_active = [t for t in (tix.get("tickets") or [])
+                  if t.get("status") == "active"]
+    by_side = group_tickets_by_side(raw_active)
+
+    return {
+        "slug": slug,
+        "title": detail.get("title") or slug,
+        "is_seated": bool(detail.get("is_seated")),
+        "poster": (detail.get("poster") or detail.get("mobile_poster")
+                   or detail.get("promo_poster") or ""),
+        "stadium_image": detail.get("stadium_image") or "",
+        "start_date": detail.get("start_date_time"),
+        "venue_name": detail.get("venue_name") or "",
+        "team_a": teams["team_a"],
+        "team_b": teams["team_b"],
+        "event_id": detail.get("_id") or "",
+        "sectors": raw_active,
+        "by_side": by_side,
+        "raw_detail": detail,
+    }
+
+
 async def get_event_tickets(slug: str,
                             lang: Optional[str] = None) -> dict[str, Any]:
     """

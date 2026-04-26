@@ -684,7 +684,23 @@ async def _select_adjacent_seats(page, quantity: int, result: dict[str, Any]) ->
     return False
 
 
-async def _scrape_seat_info(page) -> dict[str, str]:
+async def _scrape_seat_info(page) -> dict[str, Any]:
+    """
+    Extract seat information from the post-checkout review/payment page.
+
+    Returns a dict with two possible shapes (the bot UI handles either):
+
+      {
+        "seats": ["A12", "A13", "A14"],   # multi-seat list (preferred)
+        "section": "North Stand",
+        "row": "A",
+        "seat_number": "12",
+      }
+
+    Strategy: look for any DOM container that lists multiple seat
+    chips/labels first (to capture all seats for multi-ticket bookings),
+    then fall back to single-seat selectors.
+    """
     for target in [page, *page.frames]:
         try:
             info = await target.evaluate(
@@ -699,15 +715,43 @@ async def _scrape_seat_info(page) -> dict[str, str]:
                     }
                     return '';
                   };
+                  // Try to scoop ALL seat chips (multi-ticket scenario).
+                  const seatChipSelectors = [
+                    '[data-testid*="selected-seat"]',
+                    '[class*="selected-seat"]',
+                    '[data-testid*="seat-chip"]',
+                    '[class*="seat-chip"]',
+                    '[data-testid*="seat-label"]',
+                    '[class*="seat-label"]',
+                    'li[class*="seat"]',
+                  ];
+                  let seats = [];
+                  for (const sel of seatChipSelectors) {
+                    const nodes = Array.from(document.querySelectorAll(sel));
+                    if (nodes.length > 0) {
+                      seats = nodes.map(n => (n.innerText || n.textContent || '').trim())
+                                   .filter(s => s && s.length <= 16);
+                      if (seats.length > 0) break;
+                    }
+                  }
+                  // Dedupe while preserving order
+                  const seen = new Set();
+                  const uniq = [];
+                  for (const s of seats) {
+                    if (!seen.has(s)) { seen.add(s); uniq.push(s); }
+                  }
                   return {
+                    seats: uniq,
                     section: grab(['[data-testid*="section"]', '.section', '[class*="section"]', '[class*="category"]']),
                     row: grab(['[data-testid*="row"]', '[class*="row-number"]', '[class*="row"]']),
                     seat_number: grab(['[data-testid*="seat-number"]', '[class*="seat-number"]', '[class*="seat-label"]', '[data-testid*="seat"]']),
                   };
                 }"""
             )
-            if any(info.values()):
+            if isinstance(info, dict) and (
+                info.get("seats") or info.get("section") or info.get("seat_number")
+            ):
                 return info
         except Exception:
             continue
-    return {"section": "", "row": "", "seat_number": ""}
+    return {"seats": [], "section": "", "row": "", "seat_number": ""}

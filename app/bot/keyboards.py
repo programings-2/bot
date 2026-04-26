@@ -23,13 +23,20 @@ def main_menu() -> dict[str, Any]:
 
 def events_keyboard(events: list[dict], page: int = 0,
                     page_size: int = 8) -> dict[str, Any]:
+    """Football-only events list. Each row shows team_a vs team_b
+    if available, otherwise falls back to the event title."""
     start = page * page_size
     chunk = events[start:start + page_size]
     rows = []
     for e in chunk:
         t = tok.put({"slug": e["slug"]})
-        rows.append([{"text": f"• {_truncate(e['title'] or e['slug'], 50)}",
-                      "callback_data": f"evt:{t}"}])
+        ta = e.get("team_a_name") or (e.get("team_a") or {}).get("name") or ""
+        tb = e.get("team_b_name") or (e.get("team_b") or {}).get("name") or ""
+        if ta and tb:
+            label = f"⚽ {_truncate(ta, 18)} ⚔️ {_truncate(tb, 18)}"
+        else:
+            label = f"• {_truncate(e['title'] or e['slug'], 50)}"
+        rows.append([{"text": label, "callback_data": f"evt:{t}"}])
     # Pagination
     nav = []
     if page > 0:
@@ -43,6 +50,169 @@ def events_keyboard(events: list[dict], page: int = 0,
     rows.append([{"text": "🔄 تحديث", "callback_data": "events:refresh"}])
     rows.append([{"text": "⬅️ القائمة الرئيسية", "callback_data": "menu"}])
     return {"inline_keyboard": rows}
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Football-specific keyboards (interactive booking journey)
+# ═════════════════════════════════════════════════════════════════════
+def team_selection_keyboard(slug: str, team_a_name: str,
+                             team_b_name: str,
+                             buckets: dict[str, list]) -> dict[str, Any]:
+    """
+    Step 1 of the football booking flow.
+
+    Shows up to four side-tabs:
+        ⚽ جمهور {team_a}                (home / north stand)
+        ⚽ جمهور {team_b}                (away / south stand)
+        ⭐ المنصات / VIP                  (premium tickets)
+        🏟️ قطاعات أخرى                   (east/west / unknown)
+
+    *buckets* must be the dict produced by
+    :func:`football_filter.group_tickets_by_side`. Empty buckets are
+    suppressed.
+    """
+    rows = []
+    home_n = len(buckets.get("home") or [])
+    away_n = len(buckets.get("away") or [])
+    vip_n = len(buckets.get("vip") or [])
+    neu_n = len(buckets.get("neutral") or [])
+
+    if home_n:
+        t_h = tok.put({"slug": slug, "side": "home"})
+        rows.append([{
+            "text": f"🏠 جمهور {_truncate(team_a_name or 'المضيف', 22)}  —  {home_n} قطاع",
+            "callback_data": f"side:{t_h}",
+        }])
+    if away_n:
+        t_a = tok.put({"slug": slug, "side": "away"})
+        rows.append([{
+            "text": f"✌️ جمهور {_truncate(team_b_name or 'الزائر', 22)}  —  {away_n} قطاع",
+            "callback_data": f"side:{t_a}",
+        }])
+    if vip_n:
+        t_v = tok.put({"slug": slug, "side": "vip"})
+        rows.append([{
+            "text": f"⭐ المنصات / VIP  —  {vip_n} قطاع",
+            "callback_data": f"side:{t_v}",
+        }])
+    if neu_n:
+        t_n = tok.put({"slug": slug, "side": "neutral"})
+        rows.append([{
+            "text": f"🏟️ قطاعات أخرى (شرق / غرب)  —  {neu_n} قطاع",
+            "callback_data": f"side:{t_n}",
+        }])
+
+    if not rows:
+        rows.append([{
+            "text": "⚠️ لا توجد قطاعات متاحة للحجز حالياً",
+            "callback_data": "noop",
+        }])
+
+    rows.append([{"text": "⬅️ رجوع للفعاليات",
+                  "callback_data": "events:0"}])
+    rows.append([{"text": "🏠 القائمة", "callback_data": "menu"}])
+    return {"inline_keyboard": rows}
+
+
+def sector_selection_keyboard(slug: str, side: str,
+                              clusters: list[dict]) -> dict[str, Any]:
+    """
+    Step 2 — list sectors inside the chosen side.
+
+    Each *cluster* is a parent sector (one or more price tiers). When
+    a cluster has multiple tiers we route to a price-tier picker; when
+    it has a single tier we go straight to the quantity prompt.
+
+    Each row label looks like::
+
+        🟥 الفئة الأولى الشمالية  •  100 ر.س  •  متاح (أو 50 مقعد)
+    """
+    from app.services.football_filter import (
+        availability_label, short_color_emoji,
+    )
+    rows = []
+    if not clusters:
+        rows.append([{"text": "⚠️ لا توجد قطاعات في هذا الجانب",
+                       "callback_data": "noop"}])
+    for cl in clusters:
+        emoji = short_color_emoji(cl.get("color") or "")
+        title = _truncate(cl.get("title") or "قطاع", 22)
+        tiers = cl.get("tiers") or []
+        if len(tiers) == 1:
+            t = tiers[0]
+            price = t.get("display_price") or 0
+            ccy = _ccy(t.get("currency") or "SAR")
+            avail = availability_label(t.get("quantity"))
+            ptok = tok.put({
+                "slug": slug, "side": side, "ticket_id": t["id"],
+            })
+            label = f"{emoji} {title} • {_fmt_price(price)} {ccy} • {avail}"
+            rows.append([{"text": label, "callback_data": f"sec:{ptok}"}])
+        else:
+            # multiple tiers — route to tier-picker, carry cluster key
+            tids = ",".join(t["id"] for t in tiers)
+            ctok = tok.put({
+                "slug": slug, "side": side,
+                "cluster_title": cl.get("title"),
+                "ticket_ids": tids,
+            })
+            min_price = min(
+                float(t.get("display_price") or t.get("price") or 0)
+                for t in tiers
+            )
+            ccy = _ccy(tiers[0].get("currency") or "SAR")
+            label = (f"{emoji} {title} • من {_fmt_price(min_price)} {ccy} • "
+                     f"{len(tiers)} فئات")
+            rows.append([{"text": label, "callback_data": f"clu:{ctok}"}])
+
+    rows.append([{"text": "⬅️ تغيير الفريق",
+                  "callback_data": f"evt:{tok.put({'slug': slug})}"}])
+    rows.append([{"text": "🏠 القائمة", "callback_data": "menu"}])
+    return {"inline_keyboard": rows}
+
+
+def price_tier_keyboard(slug: str, side: str, ticket_ids: list[str],
+                         tickets: list[dict]) -> dict[str, Any]:
+    """Step 2b — within a multi-tier cluster, choose a single ticket."""
+    from app.services.football_filter import (
+        availability_label, short_color_emoji,
+    )
+    rows = []
+    by_id = {t["id"]: t for t in tickets}
+    for tid in ticket_ids:
+        t = by_id.get(tid)
+        if not t:
+            continue
+        price = t.get("display_price") or 0
+        ccy = _ccy(t.get("currency") or "SAR")
+        emoji = short_color_emoji(t.get("ticket_color") or "")
+        # Show the "tier suffix" (text after the dash)
+        full = t.get("title") or ""
+        import re as _re
+        parts = _re.split(r"\s*[-—–]\s*", full, maxsplit=1)
+        suffix = parts[1].strip() if len(parts) > 1 else full
+        label = (f"{emoji} {_truncate(suffix, 22)} • "
+                 f"{_fmt_price(price)} {ccy} • "
+                 f"{availability_label(t.get('quantity'))}")
+        ptok = tok.put({
+            "slug": slug, "side": side, "ticket_id": tid,
+        })
+        rows.append([{"text": label, "callback_data": f"sec:{ptok}"}])
+
+    rows.append([{"text": "⬅️ رجوع",
+                  "callback_data": f"side:{tok.put({'slug': slug, 'side': side})}"}])
+    return {"inline_keyboard": rows}
+
+
+def cart_review_keyboard(context_token: str) -> dict[str, Any]:
+    """Step 4 — final review screen before booking."""
+    return {"inline_keyboard": [
+        [{"text": "✅ تأكيد الحجز",
+          "callback_data": f"go:{context_token}"}],
+        [{"text": "✏️ تعديل العدد",
+          "callback_data": f"qty:{context_token}"}],
+        [{"text": "❌ إلغاء", "callback_data": "cart:cancel"}],
+    ]}
 
 
 def ticket_types_keyboard(event_slug: str,
